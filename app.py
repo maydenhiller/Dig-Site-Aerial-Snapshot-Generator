@@ -140,13 +140,13 @@ def format_step(step, dist_mi):
     instr = man.get("instruction", "").strip()
     road_after = step_road_name(step)
 
-    # Depart: “Drive on X for …”
+    # Depart: explicit “Drive on X …”
     if man_type == "depart":
         if road_after:
             return f"- Drive on {road_after} for {dist_mi:.2f} miles"
         return f"- Drive for {dist_mi:.2f} miles"
 
-    # Typical turn / merge / exit steps
+    # Typical turn/merge/exit steps
     if man_type in ("turn", "fork", "merge", "exit", "roundabout", "on ramp", "off ramp"):
         if road_after and (" onto " not in instr and " on " not in instr):
             return f"- {instr} onto {road_after}; continue for {dist_mi:.2f} miles"
@@ -173,20 +173,23 @@ with st.form("dig_form", clear_on_submit=False):
 if submitted:
     try:
         # 1) Nearest town (name and center)
-        town_url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{lon},{lat}.json?types=place&access_token={MAPBOX_TOKEN}"
+        town_url = (
+            f"https://api.mapbox.com/geocoding/v5/mapbox.places/"
+            f"{lon},{lat}.json?types=place&language=en&access_token={MAPBOX_TOKEN}"
+        )
         town_resp = requests.get(town_url).json()
         if not town_resp.get("features"):
             st.error("No nearby town found.")
             st.stop()
         town_feat = town_resp["features"][0]
         town_name, town_state = extract_town_state(town_feat)
-        town_center = town_feat["center"]  # [lon, lat]
 
-        # 2) First route from town center to dig (to get true route start coord)
+        # 2) Seed route from town center to dig to get actual route start coord
+        town_center = town_feat["center"]  # [lon, lat]
         dir_seed_url = (
             f"https://api.mapbox.com/directions/v5/mapbox/driving/"
             f"{town_center[0]},{town_center[1]};{lon},{lat}"
-            f"?steps=true&geometries=polyline&overview=full&access_token={MAPBOX_TOKEN}"
+            f"?steps=true&geometries=polyline&overview=full&language=en&access_token={MAPBOX_TOKEN}"
         )
         dir_seed = requests.get(dir_seed_url).json()
         if not dir_seed.get("routes"):
@@ -194,19 +197,17 @@ if submitted:
             st.stop()
         seed_route = dir_seed["routes"][0]
         seed_steps = seed_route["legs"][0]["steps"]
-
-        # Align start to the actual first step’s start location
         first_step = seed_steps[0]
         start_location = first_step["maneuver"]["location"]  # [lon, lat]
 
-        # 3) Label that start location with an intersection near it (inside the town)
+        # 3) Label intersection near that true start location
         intersection_label = pick_intersection_label_near_point(start_location[0], start_location[1])
 
-        # 4) Final directions from this aligned start to the dig site
+        # 4) Final directions from aligned start to dig
         dir_url = (
             f"https://api.mapbox.com/directions/v5/mapbox/driving/"
             f"{start_location[0]},{start_location[1]};{lon},{lat}"
-            f"?steps=true&geometries=polyline&overview=full&access_token={MAPBOX_TOKEN}"
+            f"?steps=true&geometries=polyline&overview=full&language=en&access_token={MAPBOX_TOKEN}"
         )
         dir_resp = requests.get(dir_url).json()
         if not dir_resp.get("routes"):
@@ -217,7 +218,7 @@ if submitted:
         steps = route["legs"][0]["steps"]
         route_coords = polyline.decode(route["geometry"])  # list of (lat, lon)
 
-        # 5) Narrative: use Mapbox instructions and road names; final left/right via nearest-segment projection
+        # 5) Narrative: Mapbox instructions + road names; final left/right via nearest-segment projection
         narrative = [f"From the intersection of {intersection_label} in {town_name}, {town_state}, travel as follows:"]
         for i, step in enumerate(steps):
             if i == len(steps) - 1:
