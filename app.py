@@ -14,9 +14,8 @@ uploaded_file = st.file_uploader("Upload Excel file (.xlsx or .xlsm)", type=["xl
 
 # --- Fetch and annotate satellite image from Mapbox ---
 def fetch_satellite_image(lat, lon, label):
-    # 6.69" wide × 3.25" high ≈ 640 × 312 pixels
-    width_px = 640
-    height_px = 312
+    width_px = 640   # 6.69" wide
+    height_px = 312  # 3.25" high
 
     url = (
         f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/"
@@ -85,7 +84,6 @@ def fetch_satellite_image(lat, lon, label):
 
 # --- Main logic ---
 if uploaded_file:
-    # Reset pointer and load workbook with evaluated values
     uploaded_file.seek(0)
     wb = load_workbook(io.BytesIO(uploaded_file.read()), data_only=True)
 
@@ -106,12 +104,13 @@ if uploaded_file:
                 for sheet in dig_tabs:
                     ws = wb[sheet]
 
-                    lat_val = ws["J13"].value
-                    lon_val = ws["J14"].value
-                    st.write(f"{sheet}: J13={lat_val}, J14={lon_val}")
+                    # Instead of J13/J14 (formulas), read AR15 and AS15 directly
+                    lat_val = ws["AR15"].value
+                    lon_val = ws["AS15"].value
+                    st.write(f"{sheet}: AR15={lat_val}, AS15={lon_val}")
 
                     if lat_val is None or lon_val is None:
-                        st.warning(f"Skipping {sheet}: J13/J14 are empty or not evaluated")
+                        st.warning(f"Skipping {sheet}: AR15/AS15 are empty")
                         continue
 
                     try:
