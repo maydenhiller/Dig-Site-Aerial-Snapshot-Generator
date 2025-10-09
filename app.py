@@ -1,9 +1,9 @@
 import streamlit as st
-import pandas as pd
 import zipfile
 import io
 import requests
 from PIL import Image, ImageDraw, ImageFont
+from openpyxl import load_workbook
 
 st.title("📑 Dig Site Aerial Snapshot Generator")
 
@@ -85,12 +85,12 @@ def fetch_satellite_image(lat, lon, label):
 
 # --- Main logic ---
 if uploaded_file:
-    # Load Excel file
-    xls = pd.ExcelFile(uploaded_file)
+    # Load workbook with data_only=True so formulas return their last calculated values
+    wb = load_workbook(uploaded_file, data_only=True)
 
     # Only include sheets that start with "dig" but are not exactly "dig list"
     dig_tabs = [
-        sheet for sheet in xls.sheet_names
+        sheet for sheet in wb.sheetnames
         if sheet.lower().startswith("dig") and sheet.lower() != "dig list"
     ]
 
@@ -103,11 +103,13 @@ if uploaded_file:
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w") as zip_file:
                 for sheet in dig_tabs:
-                    df = pd.read_excel(uploaded_file, sheet_name=sheet, header=None)
+                    ws = wb[sheet]
 
                     try:
-                        lat = float(df.iloc[12, 9])  # J13
-                        lon = float(df.iloc[13, 9])  # J14
+                        # J13 = row 13, col 10
+                        lat = float(ws["J13"].value)
+                        # J14 = row 14, col 10
+                        lon = float(ws["J14"].value)
                     except Exception as e:
                         st.warning(f"Skipping {sheet}: could not read coordinates ({e})")
                         continue
