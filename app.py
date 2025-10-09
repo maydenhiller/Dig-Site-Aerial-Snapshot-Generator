@@ -18,7 +18,7 @@ if "map_html" not in st.session_state:
     st.session_state.map_html = None
 
 # =========================
-# Helpers
+# Geometry helpers (Web Mercator)
 # =========================
 def mercator_xy(lon, lat):
     R = 6378137.0
@@ -27,7 +27,6 @@ def mercator_xy(lon, lat):
     return x, y
 
 def segment_projection(a_lon, a_lat, b_lon, b_lat, p_lon, p_lat):
-    """Return (t, projx, projy, ax, ay, bx, by). t is clamped [0,1] on segment AB in meters (Web Mercator)."""
     ax, ay = mercator_xy(a_lon, a_lat)
     bx, by = mercator_xy(b_lon, b_lat)
     px, py = mercator_xy(p_lon, p_lat)
@@ -35,62 +34,60 @@ def segment_projection(a_lon, a_lat, b_lon, b_lat, p_lon, p_lat):
     seg_len2 = vx*vx + vy*vy
     if seg_len2 == 0:
         return 0.0, ax, ay, ax, ay, bx, by
-    t = ( (px - ax)*vx + (py - ay)*vy ) / seg_len2
+    t = ((px - ax)*vx + (py - ay)*vy) / seg_len2
     t = max(0.0, min(1.0, t))
     projx, projy = ax + t*vx, ay + t*vy
     return t, projx, projy, ax, ay, bx, by
 
 def nearest_segment_with_projection(route_latlon, dig_lat, dig_lon):
-    """Find nearest route segment to dig point; return endpoints (lon,lat) and projection point (meters)."""
+    """Find nearest route segment to the dig point; return endpoints (lon,lat) and projection point."""
     best = None
     best_d2 = float("inf")
+    px, py = mercator_xy(dig_lon, dig_lat)
     for i in range(len(route_latlon) - 1):
         (alat, alon) = route_latlon[i]
         (blat, blon) = route_latlon[i+1]
         t, projx, projy, ax, ay, bx, by = segment_projection(alon, alat, blon, blat, dig_lon, dig_lat)
-        dx = mercator_xy(dig_lon, dig_lat)[0] - projx
-        dy = mercator_xy(dig_lon, dig_lat)[1] - projy
+        dx, dy = px - projx, py - projy
         d2 = dx*dx + dy*dy
         if d2 < best_d2:
             best_d2 = d2
-            best = ( (alon, alat), (blon, blat), (projx, projy), t, (ax, ay), (bx, by) )
-    return best  # ((a_lon,a_lat),(b_lon,b_lat),(projx,projy),t,(ax,ay),(bx,by))
+            best = ((alon, alat), (blon, blat), (projx, projy), t)
+    return best  # ((a_lon,a_lat),(b_lon,b_lat),(projx,projy),t)
 
 def side_from_local_tangent(a_ll, b_ll, proj_xy, dig_lon, dig_lat):
-    """Determine left/right using local tangent (from projection forward along the segment)."""
     ax, ay = mercator_xy(a_ll[0], a_ll[1])
     bx, by = mercator_xy(b_ll[0], b_ll[1])
     projx, projy = proj_xy
-    # Tangent direction along segment (B - A)
-    tx, ty = (bx - ax, by - ay)
-    # Vector from projection to point
+    tx, ty = (bx - ax, by - ay)            # tangent along segment
     px, py = mercator_xy(dig_lon, dig_lat)
-    wx, wy = (px - projx, py - projy)
-    # Cross product of tangent and offset
+    wx, wy = (px - projx, py - projy)      # offset from road to dig point
     cross = tx*wy - ty*wx
     return "left" if cross > 0 else "right"
 
 def side_relative_to_route(route_latlon, dig_lat, dig_lon):
-    """Robust left/right: nearest segment, project dig point, use local tangent heading."""
     if len(route_latlon) < 2:
         return "right"
     nearest = nearest_segment_with_projection(route_latlon, dig_lat, dig_lon)
     if not nearest:
         return "right"
-    a_ll, b_ll, proj_xy, t, _, _ = nearest
+    a_ll, b_ll, proj_xy, _ = nearest
     return side_from_local_tangent(a_ll, b_ll, proj_xy, dig_lon, dig_lat)
 
+# =========================
+# Town and intersection helpers
+# =========================
 def extract_town_state(feature):
     town, state = "", ""
     for c in feature.get("context", []):
-        cid = c.get("id","")
-        if cid.startswith("place."): town = c.get("text","")
-        if cid.startswith("region."): state = c.get("text","")
-    if not town: town = feature.get("text","")
+        cid = c.get("id", "")
+        if cid.startswith("place."): town = c.get("text", "")
+        if cid.startswith("region."): state = c.get("text", "")
+    if not town:
+        town = feature.get("text", "")
     return town, state
 
 def pick_intersection_label_near_town_center(town_center_ll):
-    # Pull recognizable road names near town center via Tilequery
     tile_url = (
         f"https://api.mapbox.com/v4/mapbox.mapbox-streets-v8/tilequery/"
         f"{town_center_ll[0]},{town_center_ll[1]}.json?"
@@ -101,12 +98,12 @@ def pick_intersection_label_near_town_center(town_center_ll):
     for f in r.get("features", []):
         props = f.get("properties", {})
         name = props.get("name")
-        cls = props.get("class","")
+        cls = props.get("class", "")
         if not name:
             continue
         if name in primary or name in other:
             continue
-        if cls in ("motorway","trunk","primary","secondary","tertiary"):
+        if cls in ("motorway", "trunk", "primary", "secondary", "tertiary"):
             primary.append(name)
         else:
             other.append(name)
@@ -119,6 +116,9 @@ def pick_intersection_label_near_town_center(town_center_ll):
         return names[0]
     return "Unknown Intersection"
 
+# =========================
+# Turn-by-turn formatting
+# =========================
 def step_road_name(step):
     # Prefer explicit step name; fall back to parsing instruction
     name = step.get("name")
@@ -139,17 +139,18 @@ def format_step(step, dist_mi):
     instr = man.get("instruction", "").strip()
     road_after = step_road_name(step)
 
+    # Depart: “Drive on X for …”
     if man_type == "depart":
         if road_after:
-            return f"- Continue on {road_after} for {dist_mi:.2f} miles"
-        return f"- Continue for {dist_mi:.2f} miles"
+            return f"- Drive on {road_after} for {dist_mi:.2f} miles"
+        return f"- Drive for {dist_mi:.2f} miles"
 
+    # Typical turn / merge / exit steps
     if man_type in ("turn", "fork", "merge", "exit", "roundabout", "on ramp", "off ramp"):
-        # Ensure we mention the road even if Mapbox instruction omits it
         if road_after and (" onto " not in instr and " on " not in instr):
-            return f"- {instr} and continue on {road_after} for {dist_mi:.2f} miles"
+            return f"- {instr} onto {road_after}; continue for {dist_mi:.2f} miles"
         if road_after:
-            return f"- {instr} and continue on {road_after} for {dist_mi:.2f} miles"
+            return f"- {instr}; continue on {road_after} for {dist_mi:.2f} miles"
         return f"- {instr} for {dist_mi:.2f} miles"
 
     # Generic continuation
@@ -158,7 +159,7 @@ def format_step(step, dist_mi):
     return f"- Continue for {dist_mi:.2f} miles"
 
 # =========================
-# Input form
+# Input form (prevents intermediate reruns)
 # =========================
 with st.form("dig_form", clear_on_submit=False):
     lat = st.number_input("Latitude", value=39.432544, format="%.6f")
@@ -180,11 +181,11 @@ if submitted:
         town_name, town_state = extract_town_state(town_feat)
         town_center = town_feat["center"]  # [lon, lat]
 
-        # 2) Intersection label
+        # 2) Intersection label in that town
         intersection_label = pick_intersection_label_near_town_center(town_center)
         start_coords = town_center  # [lon, lat]
 
-        # 3) Directions (full overview for geometry)
+        # 3) Directions with steps and full geometry
         dir_url = (
             f"https://api.mapbox.com/directions/v5/mapbox/driving/"
             f"{start_coords[0]},{start_coords[1]};{lon},{lat}"
@@ -199,11 +200,10 @@ if submitted:
         steps = route["legs"][0]["steps"]
         route_coords = polyline.decode(route["geometry"])  # list of (lat, lon)
 
-        # 4) Narrative: use Mapbox instructions and road names
+        # 4) Narrative using instructions and road names; final left/right via nearest-segment projection
         narrative = [f"From the intersection of {intersection_label} in {town_name}, {town_state}, travel as follows:"]
         for i, step in enumerate(steps):
             if i == len(steps) - 1:
-                # Final: robust left/right
                 side = side_relative_to_route(route_coords, lat, lon)
                 narrative.append(f"- The dig site will be located on your {side}.")
             else:
