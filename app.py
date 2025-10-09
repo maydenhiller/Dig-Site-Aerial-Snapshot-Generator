@@ -85,8 +85,9 @@ def fetch_satellite_image(lat, lon, label):
 
 # --- Main logic ---
 if uploaded_file:
-    # Load workbook with data_only=True so formulas return their last calculated values
-    wb = load_workbook(uploaded_file, data_only=True)
+    # Reset pointer and load workbook with evaluated values
+    uploaded_file.seek(0)
+    wb = load_workbook(io.BytesIO(uploaded_file.read()), data_only=True)
 
     # Only include sheets that start with "dig" but are not exactly "dig list"
     dig_tabs = [
@@ -105,18 +106,27 @@ if uploaded_file:
                 for sheet in dig_tabs:
                     ws = wb[sheet]
 
+                    lat_val = ws["J13"].value
+                    lon_val = ws["J14"].value
+                    st.write(f"{sheet}: J13={lat_val}, J14={lon_val}")
+
+                    if lat_val is None or lon_val is None:
+                        st.warning(f"Skipping {sheet}: J13/J14 are empty or not evaluated")
+                        continue
+
                     try:
-                        # J13 = row 13, col 10
-                        lat = float(ws["J13"].value)
-                        # J14 = row 14, col 10
-                        lon = float(ws["J14"].value)
+                        lat = float(lat_val)
+                        lon = float(lon_val)
                     except Exception as e:
-                        st.warning(f"Skipping {sheet}: could not read coordinates ({e})")
+                        st.warning(f"Skipping {sheet}: could not convert coordinates ({e})")
                         continue
 
                     image_data = fetch_satellite_image(lat, lon, sheet)
                     if image_data:
+                        st.success(f"Generated image for {sheet}")
                         zip_file.writestr(f"{sheet}.jpg", image_data)
+                    else:
+                        st.error(f"Failed to fetch image for {sheet}")
 
             zip_buffer.seek(0)
             st.download_button(
