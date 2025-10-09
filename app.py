@@ -26,48 +26,59 @@ def mercator_xy(lon, lat):
     y = math.log(math.tan(math.pi/4 + math.radians(lat)/2)) * R
     return x, y
 
-def segment_distance_sq(a_lon, a_lat, b_lon, b_lat, p_lon, p_lat):
-    ax, ay = mercator_xy(a_lon, a_lat)
-    bx, by = mercator_xy(b_lon, b_lat)
-    px, py = mercator_xy(p_lon, p_lat)
-    vx, vy = (bx - ax, by - ay)         # segment vector
-    wx, wy = (px - ax, py - ay)         # point vector
-    seg_len2 = vx*vx + vy*vy
-    if seg_len2 == 0:
-        # degenerate segment
-        dx, dy = px - ax, py - ay
-        return dx*dx + dy*dy, (ax, ay), (bx, by), (px, py)
-    t = max(0.0, min(1.0, (wx*vx + wy*vy) / seg_len2))  # clamp to segment
-    projx, projy = ax + t*vx, ay + t*vy
-    dx, dy = px - projx, py - projy
-    return dx*dx + dy*dy, (ax, ay), (bx, by), (px, py)
-
-def left_or_right_from_segment(a_lon, a_lat, b_lon, b_lat, p_lon, p_lat):
+def segment_projection(a_lon, a_lat, b_lon, b_lat, p_lon, p_lat):
+    """Return (t, projx, projy, ax, ay, bx, by). t is clamped [0,1] on segment AB in meters (Web Mercator)."""
     ax, ay = mercator_xy(a_lon, a_lat)
     bx, by = mercator_xy(b_lon, b_lat)
     px, py = mercator_xy(p_lon, p_lat)
     vx, vy = (bx - ax, by - ay)
-    wx, wy = (px - ax, py - ay)
-    cross = vx*wy - vy*wx
-    return "left" if cross > 0 else "right"
+    seg_len2 = vx*vx + vy*vy
+    if seg_len2 == 0:
+        return 0.0, ax, ay, ax, ay, bx, by
+    t = ( (px - ax)*vx + (py - ay)*vy ) / seg_len2
+    t = max(0.0, min(1.0, t))
+    projx, projy = ax + t*vx, ay + t*vy
+    return t, projx, projy, ax, ay, bx, by
 
-def side_relative_to_route_nearest_segment(route_latlon, dig_lat, dig_lon):
-    # route_latlon: [(lat, lon), ...]
-    if len(route_latlon) < 2:
-        return "right"
+def nearest_segment_with_projection(route_latlon, dig_lat, dig_lon):
+    """Find nearest route segment to dig point; return endpoints (lon,lat) and projection point (meters)."""
+    best = None
     best_d2 = float("inf")
-    best_seg = None
     for i in range(len(route_latlon) - 1):
         (alat, alon) = route_latlon[i]
         (blat, blon) = route_latlon[i+1]
-        d2, _, _, _ = segment_distance_sq(alon, alat, blon, blat, dig_lon, dig_lat)
+        t, projx, projy, ax, ay, bx, by = segment_projection(alon, alat, blon, blat, dig_lon, dig_lat)
+        dx = mercator_xy(dig_lon, dig_lat)[0] - projx
+        dy = mercator_xy(dig_lon, dig_lat)[1] - projy
+        d2 = dx*dx + dy*dy
         if d2 < best_d2:
             best_d2 = d2
-            best_seg = (alon, alat, blon, blat)  # (a_lon, a_lat, b_lon, b_lat)
-    if not best_seg:
+            best = ( (alon, alat), (blon, blat), (projx, projy), t, (ax, ay), (bx, by) )
+    return best  # ((a_lon,a_lat),(b_lon,b_lat),(projx,projy),t,(ax,ay),(bx,by))
+
+def side_from_local_tangent(a_ll, b_ll, proj_xy, dig_lon, dig_lat):
+    """Determine left/right using local tangent (from projection forward along the segment)."""
+    ax, ay = mercator_xy(a_ll[0], a_ll[1])
+    bx, by = mercator_xy(b_ll[0], b_ll[1])
+    projx, projy = proj_xy
+    # Tangent direction along segment (B - A)
+    tx, ty = (bx - ax, by - ay)
+    # Vector from projection to point
+    px, py = mercator_xy(dig_lon, dig_lat)
+    wx, wy = (px - projx, py - projy)
+    # Cross product of tangent and offset
+    cross = tx*wy - ty*wx
+    return "left" if cross > 0 else "right"
+
+def side_relative_to_route(route_latlon, dig_lat, dig_lon):
+    """Robust left/right: nearest segment, project dig point, use local tangent heading."""
+    if len(route_latlon) < 2:
         return "right"
-    a_lon, a_lat, b_lon, b_lat = best_seg
-    return left_or_right_from_segment(a_lon, a_lat, b_lon, b_lat, dig_lon, dig_lat)
+    nearest = nearest_segment_with_projection(route_latlon, dig_lat, dig_lon)
+    if not nearest:
+        return "right"
+    a_ll, b_ll, proj_xy, t, _, _ = nearest
+    return side_from_local_tangent(a_ll, b_ll, proj_xy, dig_lon, dig_lat)
 
 def extract_town_state(feature):
     town, state = "", ""
@@ -122,17 +133,29 @@ def step_road_name(step):
             return part
     return ""
 
-def format_turn_step(step, dist_mi):
+def format_step(step, dist_mi):
     man = step.get("maneuver", {})
+    man_type = man.get("type", "")
     instr = man.get("instruction", "").strip()
     road_after = step_road_name(step)
-    if road_after and ("onto " not in instr and "on " not in instr):
-        # Add explicit road context when Mapbox instruction lacks it
-        return f"- {instr} and continue on {road_after} for {dist_mi:.2f} miles"
-    elif road_after:
-        return f"- {instr} and continue on {road_after} for {dist_mi:.2f} miles"
-    else:
+
+    if man_type == "depart":
+        if road_after:
+            return f"- Continue on {road_after} for {dist_mi:.2f} miles"
+        return f"- Continue for {dist_mi:.2f} miles"
+
+    if man_type in ("turn", "fork", "merge", "exit", "roundabout", "on ramp", "off ramp"):
+        # Ensure we mention the road even if Mapbox instruction omits it
+        if road_after and (" onto " not in instr and " on " not in instr):
+            return f"- {instr} and continue on {road_after} for {dist_mi:.2f} miles"
+        if road_after:
+            return f"- {instr} and continue on {road_after} for {dist_mi:.2f} miles"
         return f"- {instr} for {dist_mi:.2f} miles"
+
+    # Generic continuation
+    if road_after:
+        return f"- Continue on {road_after} for {dist_mi:.2f} miles"
+    return f"- Continue for {dist_mi:.2f} miles"
 
 # =========================
 # Input form
@@ -159,7 +182,7 @@ if submitted:
 
         # 2) Intersection label
         intersection_label = pick_intersection_label_near_town_center(town_center)
-        start_coords = town_center
+        start_coords = town_center  # [lon, lat]
 
         # 3) Directions (full overview for geometry)
         dir_url = (
@@ -174,34 +197,18 @@ if submitted:
 
         route = dir_resp["routes"][0]
         steps = route["legs"][0]["steps"]
-        route_coords = polyline.decode(route["geometry"])  # [(lat, lon), ...]
+        route_coords = polyline.decode(route["geometry"])  # list of (lat, lon)
 
-        # 4) Narrative: use maneuver.instructions and road names
+        # 4) Narrative: use Mapbox instructions and road names
         narrative = [f"From the intersection of {intersection_label} in {town_name}, {town_state}, travel as follows:"]
         for i, step in enumerate(steps):
-            dist_mi = step["distance"] / 1609.34
-            man = step.get("maneuver", {})
-            man_type = man.get("type", "")
-            road_after = step_road_name(step)
-
             if i == len(steps) - 1:
-                # Final: correct left/right relative to nearest route segment to the dig point
-                side = side_relative_to_route_nearest_segment(route_coords, lat, lon)
+                # Final: robust left/right
+                side = side_relative_to_route(route_coords, lat, lon)
                 narrative.append(f"- The dig site will be located on your {side}.")
             else:
-                if man_type == "depart":
-                    if road_after:
-                        narrative.append(f"- Continue on {road_after} for {dist_mi:.2f} miles")
-                    else:
-                        narrative.append(f"- Continue for {dist_mi:.2f} miles")
-                elif man_type in ("turn", "fork", "merge", "exit", "roundabout", "on ramp", "off ramp"):
-                    narrative.append(format_turn_step(step, dist_mi))
-                else:
-                    # Generic continuation (Mapbox often uses 'continue' and provides the road name)
-                    if road_after:
-                        narrative.append(f"- Continue on {road_after} for {dist_mi:.2f} miles")
-                    else:
-                        narrative.append(f"- Continue for {dist_mi:.2f} miles")
+                dist_mi = step["distance"] / 1609.34
+                narrative.append(format_step(step, dist_mi))
 
         # 5) Map
         m = folium.Map(location=[lat, lon], zoom_start=14)
