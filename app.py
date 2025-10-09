@@ -66,6 +66,7 @@ def side_from_local_tangent(a_ll, b_ll, proj_xy, dig_lon, dig_lat):
     return "left" if cross > 0 else "right"
 
 def side_relative_to_route(route_latlon, dig_lat, dig_lon):
+    """Robust left/right: nearest segment, project dig point, use local tangent heading."""
     if len(route_latlon) < 2:
         return "right"
     nearest = nearest_segment_with_projection(route_latlon, dig_lat, dig_lon)
@@ -87,11 +88,11 @@ def extract_town_state(feature):
         town = feature.get("text", "")
     return town, state
 
-def pick_intersection_label_near_town_center(town_center_ll):
+def pick_intersection_label_near_point(lon, lat):
+    """Label a recognizable intersection near a coordinate using Tilequery roads."""
     tile_url = (
         f"https://api.mapbox.com/v4/mapbox.mapbox-streets-v8/tilequery/"
-        f"{town_center_ll[0]},{town_center_ll[1]}.json?"
-        f"layers=road&radius=900&limit=24&access_token={MAPBOX_TOKEN}"
+        f"{lon},{lat}.json?layers=road&radius=300&limit=24&access_token={MAPBOX_TOKEN}"
     )
     r = requests.get(tile_url).json()
     primary, other = [], []
@@ -171,7 +172,7 @@ with st.form("dig_form", clear_on_submit=False):
 # =========================
 if submitted:
     try:
-        # 1) Nearest town
+        # 1) Nearest town (name and center)
         town_url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{lon},{lat}.json?types=place&access_token={MAPBOX_TOKEN}"
         town_resp = requests.get(town_url).json()
         if not town_resp.get("features"):
@@ -181,14 +182,30 @@ if submitted:
         town_name, town_state = extract_town_state(town_feat)
         town_center = town_feat["center"]  # [lon, lat]
 
-        # 2) Intersection label in that town
-        intersection_label = pick_intersection_label_near_town_center(town_center)
-        start_coords = town_center  # [lon, lat]
+        # 2) First route from town center to dig (to get true route start coord)
+        dir_seed_url = (
+            f"https://api.mapbox.com/directions/v5/mapbox/driving/"
+            f"{town_center[0]},{town_center[1]};{lon},{lat}"
+            f"?steps=true&geometries=polyline&overview=full&access_token={MAPBOX_TOKEN}"
+        )
+        dir_seed = requests.get(dir_seed_url).json()
+        if not dir_seed.get("routes"):
+            st.error("No route found from town.")
+            st.stop()
+        seed_route = dir_seed["routes"][0]
+        seed_steps = seed_route["legs"][0]["steps"]
 
-        # 3) Directions with steps and full geometry
+        # Align start to the actual first step’s start location
+        first_step = seed_steps[0]
+        start_location = first_step["maneuver"]["location"]  # [lon, lat]
+
+        # 3) Label that start location with an intersection near it (inside the town)
+        intersection_label = pick_intersection_label_near_point(start_location[0], start_location[1])
+
+        # 4) Final directions from this aligned start to the dig site
         dir_url = (
             f"https://api.mapbox.com/directions/v5/mapbox/driving/"
-            f"{start_coords[0]},{start_coords[1]};{lon},{lat}"
+            f"{start_location[0]},{start_location[1]};{lon},{lat}"
             f"?steps=true&geometries=polyline&overview=full&access_token={MAPBOX_TOKEN}"
         )
         dir_resp = requests.get(dir_url).json()
@@ -200,7 +217,7 @@ if submitted:
         steps = route["legs"][0]["steps"]
         route_coords = polyline.decode(route["geometry"])  # list of (lat, lon)
 
-        # 4) Narrative using instructions and road names; final left/right via nearest-segment projection
+        # 5) Narrative: use Mapbox instructions and road names; final left/right via nearest-segment projection
         narrative = [f"From the intersection of {intersection_label} in {town_name}, {town_state}, travel as follows:"]
         for i, step in enumerate(steps):
             if i == len(steps) - 1:
@@ -210,10 +227,10 @@ if submitted:
                 dist_mi = step["distance"] / 1609.34
                 narrative.append(format_step(step, dist_mi))
 
-        # 5) Map
+        # 6) Map
         m = folium.Map(location=[lat, lon], zoom_start=14)
         folium.Marker([lat, lon], tooltip="Dig Site", icon=folium.Icon(color="red")).add_to(m)
-        folium.Marker([start_coords[1], start_coords[0]], tooltip="Start Intersection").add_to(m)
+        folium.Marker([start_location[1], start_location[0]], tooltip="Start Intersection").add_to(m)
         folium.PolyLine(route_coords, color="blue", weight=3).add_to(m)
 
         st.session_state.narrative = narrative
