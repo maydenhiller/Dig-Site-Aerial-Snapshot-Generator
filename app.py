@@ -10,7 +10,7 @@ st.title("Dig Site Directions Generator")
 lat = st.number_input("Latitude", value=35.4676, format="%.6f")
 lon = st.number_input("Longitude", value=-97.5164, format="%.6f")
 
-# Initialize session state
+# --- Initialize session state ---
 if "narrative" not in st.session_state:
     st.session_state.narrative = None
 if "map_html" not in st.session_state:
@@ -20,8 +20,9 @@ def bearing_to_cardinal(bearing):
     dirs = ["North","Northeast","East","Southeast","South","Southwest","West","Northwest"]
     return dirs[round(bearing/45) % 8]
 
+# --- Compute once when button is pressed ---
 if st.button("Get Directions"):
-    # --- Reverse geocode ---
+    # Reverse geocode
     geo_url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{lon},{lat}.json?types=address&access_token={MAPBOX_TOKEN}"
     geo_resp = requests.get(geo_url).json()
     if not geo_resp.get("features"):
@@ -35,7 +36,7 @@ if st.button("Get Directions"):
     town = context.get("place","Unknown Town")
     state = context.get("region","")
 
-    # --- Directions ---
+    # Directions
     dir_url = f"https://api.mapbox.com/directions/v5/mapbox/driving/{start_coords[0]},{start_coords[1]};{lon},{lat}?steps=true&geometries=polyline&access_token={MAPBOX_TOKEN}"
     dir_resp = requests.get(dir_url).json()
     steps = dir_resp["routes"][0]["legs"][0]["steps"]
@@ -58,14 +59,19 @@ if st.button("Get Directions"):
     folium.Marker([start_coords[1], start_coords[0]], tooltip="Start Point").add_to(m)
     folium.PolyLine(coords, color="blue", weight=3).add_to(m)
 
-    # Save results
+    # Save results to session state
     st.session_state.narrative = narrative
     st.session_state.map_html = m._repr_html_()
 
-# --- Display cached results ---
+# --- Always render from session state ---
 if st.session_state.narrative:
     st.subheader("Turn‑by‑Turn Directions")
     st.write("\n".join(st.session_state.narrative))
 
 if st.session_state.map_html:
     st.components.v1.html(st.session_state.map_html, height=500)
+
+# --- Optional: clear button ---
+if st.button("Clear Results"):
+    st.session_state.narrative = None
+    st.session_state.map_html = None
