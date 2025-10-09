@@ -17,29 +17,45 @@ if not MAPBOX_TOKEN:
 
 # --- Mapbox fetch ---
 def fetch_satellite_image(lat, lon, label, token):
+    width_px = 1280
+    height_px = 624  # sharper resolution, same aspect ratio
+
     url = (
         f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/"
-        f"{lon},{lat},18,0/640x312?access_token={token}"
+        f"{lon},{lat},18,0/{width_px}x{height_px}?access_token={token}"
     )
     resp = requests.get(url, timeout=20)
     if resp.status_code != 200:
         st.error(f"Mapbox error {resp.status_code}: {resp.text[:200]}")
         return None
+
     image = Image.open(io.BytesIO(resp.content)).convert("RGB")
     draw = ImageDraw.Draw(image)
+
     # Yellow dot at center
-    cx, cy = image.width//2, image.height//2
+    cx, cy = image.width // 2, image.height // 2
     draw.ellipse([(cx-6, cy-6), (cx+6, cy+6)], fill="yellow", outline="black")
+
     # Label
     label = label.upper()
     try:
         font = ImageFont.truetype("arial.ttf", 28)
     except:
         font = ImageFont.load_default()
-    tw, th = draw.textlength(label, font=font), 28
-    lx, ly = cx+12, cy-th-6
+
+    # Measure text size properly
+    try:
+        bbox = font.getbbox(label)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    except Exception:
+        tw, th = draw.textlength(label, font=font), 28
+
+    lx, ly = cx + 12, cy - th - 6
+
+    # Background box hugging text
     draw.rectangle([lx-4, ly-4, lx+tw+4, ly+th+4], fill="white", outline="black")
     draw.text((lx, ly), label, fill="black", font=font)
+
     buf = io.BytesIO()
     image.save(buf, format="JPEG")
     buf.seek(0)
@@ -64,7 +80,6 @@ if uploaded_file and MAPBOX_TOKEN:
                 for sheet in dig_tabs:
                     ws = wb[sheet]
                     lat_val, lon_val = ws["AR15"].value, ws["AS15"].value
-                    st.write(f"{sheet}: AR15={lat_val}, AS15={lon_val}")
                     try:
                         lat, lon = float(lat_val), float(lon_val)
                     except Exception as e:
