@@ -104,7 +104,7 @@ if uploaded_file:
                 for sheet in dig_tabs:
                     ws = wb[sheet]
 
-                    # Instead of J13/J14 (formulas), read AR15 and AS15 directly
+                    # Read AR15 and AS15 directly
                     lat_val = ws["AR15"].value
                     lon_val = ws["AS15"].value
                     st.write(f"{sheet}: AR15={lat_val}, AS15={lon_val}")
