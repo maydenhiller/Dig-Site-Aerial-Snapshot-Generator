@@ -88,10 +88,14 @@ if uploaded_file:
     # Load Excel file
     xls = pd.ExcelFile(uploaded_file)
 
-    dig_tabs = [sheet for sheet in xls.sheet_names if sheet.lower().startswith("dig")]
+    # Only include sheets that start with "dig" but are not exactly "dig list"
+    dig_tabs = [
+        sheet for sheet in xls.sheet_names
+        if sheet.lower().startswith("dig") and sheet.lower() != "dig list"
+    ]
 
     if not dig_tabs:
-        st.error("No tabs found starting with 'Dig'.")
+        st.error("No valid Dig tabs found (excluding 'Dig list').")
     else:
         st.success(f"Found {len(dig_tabs)} Dig tabs: {', '.join(dig_tabs)}")
 
@@ -102,8 +106,8 @@ if uploaded_file:
                     df = pd.read_excel(uploaded_file, sheet_name=sheet, header=None)
 
                     try:
-                        lat = float(df.iloc[12, 9])  # J13 → row 12, col 9 (0-based)
-                        lon = float(df.iloc[13, 9])  # J14 → row 13, col 9
+                        lat = float(df.iloc[12, 9])  # J13
+                        lon = float(df.iloc[13, 9])  # J14
                     except Exception as e:
                         st.warning(f"Skipping {sheet}: could not read coordinates ({e})")
                         continue
