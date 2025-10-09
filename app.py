@@ -31,7 +31,6 @@ def mercator_xy(lon, lat):
     return x, y
 
 def nearest_vertex_index(route_latlon, dig_lat, dig_lon):
-    # route_latlon: list of (lat, lon)
     px, py = mercator_xy(dig_lon, dig_lat)
     best_i, best_d2 = 0, float("inf")
     for i, (lat, lon) in enumerate(route_latlon):
@@ -42,21 +41,18 @@ def nearest_vertex_index(route_latlon, dig_lat, dig_lon):
     return best_i
 
 def side_of_segment(seg_start_ll, seg_end_ll, point_ll):
-    # Inputs are (lon, lat)
     sx, sy = mercator_xy(seg_start_ll[0], seg_start_ll[1])
     ex, ey = mercator_xy(seg_end_ll[0], seg_end_ll[1])
     px, py = mercator_xy(point_ll[0], point_ll[1])
-    vx, vy = (ex - sx, ey - sy)       # segment vector
-    wx, wy = (px - sx, py - sy)       # point-from-start vector
+    vx, vy = (ex - sx, ey - sy)
+    wx, wy = (px - sx, py - sy)
     cross = vx * wy - vy * wx
     return "left" if cross > 0 else "right"
 
 def side_relative_to_route(route_latlon, dig_lat, dig_lon):
-    # Pick the segment that actually touches the nearest route vertex to the dig point
     if len(route_latlon) < 2:
-        return "right"  # fallback
+        return "right"
     i = nearest_vertex_index(route_latlon, dig_lat, dig_lon)
-
     if i == 0:
         a = route_latlon[0]; b = route_latlon[1]
     elif i == len(route_latlon) - 1:
@@ -72,8 +68,7 @@ def side_relative_to_route(route_latlon, dig_lat, dig_lon):
             a, b = a_prev, a_curr
         else:
             a, b = a_curr, a_next
-
-    seg_start_ll = (a[1], a[0])  # (lon, lat)
+    seg_start_ll = (a[1], a[0])
     seg_end_ll   = (b[1], b[0])
     return side_of_segment(seg_start_ll, seg_end_ll, (dig_lon, dig_lat))
 
@@ -87,7 +82,6 @@ def extract_town_state(feature):
     return town, state
 
 def pick_intersection_label_near_town_center(town_center_ll):
-    # Pull recognizable road names near town center via Tilequery
     tile_url = (
         f"https://api.mapbox.com/v4/mapbox.mapbox-streets-v8/tilequery/"
         f"{town_center_ll[0]},{town_center_ll[1]}.json?"
@@ -101,7 +95,6 @@ def pick_intersection_label_near_town_center(town_center_ll):
         cls = props.get("class","")
         if not name:
             continue
-        # Deduplicate while preserving order
         if name in primary or name in other:
             continue
         if cls in ("motorway","trunk","primary","secondary","tertiary"):
@@ -118,23 +111,20 @@ def pick_intersection_label_near_town_center(town_center_ll):
     return "Unknown Intersection"
 
 def step_road_name(step):
-    # Prefer explicit step name; fall back to maneuver text parsing if missing
     name = step.get("name")
     if name:
         return name
     instr = step.get("maneuver", {}).get("instruction", "")
-    # crude parse: look for 'onto XYZ' or 'on XYZ'
     for token in ["onto ", "on "]:
         if token in instr:
             part = instr.split(token, 1)[1].strip()
-            # stop at ' and', ',' or end
             for sep in [" and", ","]:
                 part = part.split(sep, 1)[0]
             return part
-    return ""  # unknown
+    return ""
 
 # =========================
-# Input form (prevents intermediate reruns)
+# Input form
 # =========================
 with st.form("dig_form", clear_on_submit=False):
     lat = st.number_input("Latitude", value=39.432544, format="%.6f")
@@ -146,7 +136,7 @@ with st.form("dig_form", clear_on_submit=False):
 # =========================
 if submitted:
     try:
-        # 1) Nearest town/city to dig site
+        # 1) Nearest town
         town_url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{lon},{lat}.json?types=place&access_token={MAPBOX_TOKEN}"
         town_resp = requests.get(town_url).json()
         if not town_resp.get("features"):
@@ -154,13 +144,13 @@ if submitted:
             st.stop()
         town_feat = town_resp["features"][0]
         town_name, town_state = extract_town_state(town_feat)
-        town_center = town_feat["center"]  # [lon, lat]
+        town_center = town_feat["center"]
 
-        # 2) Intersection label inside that town
+        # 2) Intersection label
         intersection_label = pick_intersection_label_near_town_center(town_center)
-        start_coords = town_center  # start from town center (label is the intersection name)
+        start_coords = town_center
 
-        # 3) Directions from town to dig site (use full overview for geometry)
+        # 3) Directions
         dir_url = (
             f"https://api.mapbox.com/directions/v5/mapbox/driving/"
             f"{start_coords[0]},{start_coords[1]};{lon},{lat}"
@@ -173,9 +163,9 @@ if submitted:
 
         route = dir_resp["routes"][0]
         steps = route["legs"][0]["steps"]
-        route_coords = polyline.decode(route["geometry"])  # [(lat, lon), ...]
+        route_coords = polyline.decode(route["geometry"])
 
-        # 4) Build narrative — include road names and turning info
+        # 4) Narrative
         narrative = [f"From the intersection of {intersection_label} in {town_name}, {town_state}, travel as follows:"]
 
         for i, step in enumerate(steps):
@@ -188,52 +178,19 @@ if submitted:
             road_after = step_road_name(step)
 
             if i == len(steps) - 1:
-                # Accurate left/right: segment nearest to the dig point
                 side = side_relative_to_route(route_coords, lat, lon)
                 narrative.append(f"- The dig site will be located on your {side}.")
             else:
                 if man_type == "depart":
-                    # Starting movement
                     if road_after:
                         narrative.append(f"- Drive {cardinal} on {road_after} for {dist_mi:.2f} miles")
                     else:
                         narrative.append(f"- Drive {cardinal} for {dist_mi:.2f} miles")
                 elif man_type in ("turn","fork","merge","exit","roundabout","on ramp","off ramp"):
-                    # Explicit turn/merge style using Mapbox instruction, plus cardinal and road name
                     if road_after:
-                        narrative.append(f"- {man_instr} and continue {cardinal} on {road_after} for {dist_mi:.2f} miles")
+                        narrative.append(f"- {man_instr} and continue on {road_after} for {dist_mi:.2f} miles")
                     else:
-                        narrative.append(f"- {man_instr} and continue {cardinal} for {dist_mi:.2f} miles")
+                        narrative.append(f"- {man_instr} for {dist_mi:.2f} miles")
                 else:
-                    # General continuation
                     if road_after:
-                        narrative.append(f"- Continue {cardinal} on {road_after} for {dist_mi:.2f} miles")
-                    else:
-                        narrative.append(f"- Continue {cardinal} for {dist_mi:.2f} miles")
-
-        # 5) Map
-        m = folium.Map(location=[lat, lon], zoom_start=14)
-        folium.Marker([lat, lon], tooltip="Dig Site", icon=folium.Icon(color="red")).add_to(m)
-        folium.Marker([start_coords[1], start_coords[0]], tooltip="Start Intersection").add_to(m)
-        folium.PolyLine(route_coords, color="blue", weight=3).add_to(m)
-
-        st.session_state.narrative = narrative
-        st.session_state.map_html = m._repr_html_()
-
-    except Exception as e:
-        st.error(f"Error: {e}")
-
-# =========================
-# Persisted display
-# =========================
-if st.session_state.narrative:
-    st.subheader("Turn‑by‑Turn Directions")
-    st.write("\n".join(st.session_state.narrative))
-
-if st.session_state.map_html:
-    st.components.v1.html(st.session_state.map_html, height=520)
-
-# Manual reset
-if st.button("Clear results"):
-    st.session_state.narrative = None
-    st.session_state.map_html = None
+                        narrative.append(f"- Continue {cardinal} on {road_after} for {dist_mi
