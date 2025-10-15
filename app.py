@@ -1,256 +1,124 @@
-import math
-import requests
 import streamlit as st
-import folium
-import polyline
+import io, zipfile, requests, traceback
+from openpyxl import load_workbook
+from PIL import Image, ImageDraw, ImageFont
 
-# =========================
-# Config
-# =========================
-MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
+st.set_page_config(page_title="Dig Site Aerial Snapshot Generator")
+st.title("📑 Dig Site Aerial Snapshot Generator")
 
-st.title("Dig Site Directions Generator")
+# --- Mapbox token ---
+MAPBOX_TOKEN = None
+try:
+    MAPBOX_TOKEN = st.secrets["mapbox"]["token"]
+except Exception:
+    pass
+if not MAPBOX_TOKEN:
+    MAPBOX_TOKEN = st.sidebar.text_input("Mapbox access token", type="password")
 
-# Persisted outputs
-if "narrative" not in st.session_state:
-    st.session_state.narrative = None
-if "map_html" not in st.session_state:
-    st.session_state.map_html = None
+# --- Mapbox fetch ---
+def fetch_satellite_image(lat, lon, label, token):
+    width_px = 1280
+    height_px = 624  # sharper resolution
 
-# =========================
-# Geometry helpers (Web Mercator)
-# =========================
-def mercator_xy(lon, lat):
-    R = 6378137.0
-    x = math.radians(lon) * R
-    y = math.log(math.tan(math.pi/4 + math.radians(lat)/2)) * R
-    return x, y
-
-def segment_projection(a_lon, a_lat, b_lon, b_lat, p_lon, p_lat):
-    ax, ay = mercator_xy(a_lon, a_lat)
-    bx, by = mercator_xy(b_lon, b_lat)
-    px, py = mercator_xy(p_lon, p_lat)
-    vx, vy = (bx - ax, by - ay)
-    seg_len2 = vx*vx + vy*vy
-    if seg_len2 == 0:
-        return 0.0, ax, ay, ax, ay, bx, by
-    t = ((px - ax)*vx + (py - ay)*vy) / seg_len2
-    t = max(0.0, min(1.0, t))
-    projx, projy = ax + t*vx, ay + t*vy
-    return t, projx, projy, ax, ay, bx, by
-
-def nearest_segment_with_projection(route_latlon, dig_lat, dig_lon):
-    """Find nearest route segment to the dig point; return endpoints (lon,lat) and projection point."""
-    best = None
-    best_d2 = float("inf")
-    px, py = mercator_xy(dig_lon, dig_lat)
-    for i in range(len(route_latlon) - 1):
-        (alat, alon) = route_latlon[i]
-        (blat, blon) = route_latlon[i+1]
-        t, projx, projy, ax, ay, bx, by = segment_projection(alon, alat, blon, blat, dig_lon, dig_lat)
-        dx, dy = px - projx, py - projy
-        d2 = dx*dx + dy*dy
-        if d2 < best_d2:
-            best_d2 = d2
-            best = ((alon, alat), (blon, blat), (projx, projy), t)
-    return best  # ((a_lon,a_lat),(b_lon,b_lat),(projx,projy),t)
-
-def side_from_local_tangent(a_ll, b_ll, proj_xy, dig_lon, dig_lat):
-    ax, ay = mercator_xy(a_ll[0], a_ll[1])
-    bx, by = mercator_xy(b_ll[0], b_ll[1])
-    projx, projy = proj_xy
-    tx, ty = (bx - ax, by - ay)            # tangent along segment
-    px, py = mercator_xy(dig_lon, dig_lat)
-    wx, wy = (px - projx, py - projy)      # offset from road to dig point
-    cross = tx*wy - ty*wx
-    return "left" if cross > 0 else "right"
-
-def side_relative_to_route(route_latlon, dig_lat, dig_lon):
-    """Robust left/right: nearest segment, project dig point, use local tangent heading."""
-    if len(route_latlon) < 2:
-        return "right"
-    nearest = nearest_segment_with_projection(route_latlon, dig_lat, dig_lon)
-    if not nearest:
-        return "right"
-    a_ll, b_ll, proj_xy, _ = nearest
-    return side_from_local_tangent(a_ll, b_ll, proj_xy, dig_lon, dig_lat)
-
-# =========================
-# Town and intersection helpers
-# =========================
-def extract_town_state(feature):
-    town, state = "", ""
-    for c in feature.get("context", []):
-        cid = c.get("id", "")
-        if cid.startswith("place."): town = c.get("text", "")
-        if cid.startswith("region."): state = c.get("text", "")
-    if not town:
-        town = feature.get("text", "")
-    return town, state
-
-def pick_intersection_label_near_point(lon, lat):
-    """Label a recognizable intersection near a coordinate using Tilequery roads."""
-    tile_url = (
-        f"https://api.mapbox.com/v4/mapbox.mapbox-streets-v8/tilequery/"
-        f"{lon},{lat}.json?layers=road&radius=300&limit=24&access_token={MAPBOX_TOKEN}"
+    url = (
+        f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/"
+        f"{lon},{lat},18,0/{width_px}x{height_px}?access_token={token}"
     )
-    r = requests.get(tile_url).json()
-    primary, other = [], []
-    for f in r.get("features", []):
-        props = f.get("properties", {})
-        name = props.get("name")
-        cls = props.get("class", "")
-        if not name:
-            continue
-        if name in primary or name in other:
-            continue
-        if cls in ("motorway", "trunk", "primary", "secondary", "tertiary"):
-            primary.append(name)
-        else:
-            other.append(name)
-        if len(primary) + len(other) >= 6:
-            break
-    names = primary + other
-    if len(names) >= 2:
-        return f"{names[0]} & {names[1]}"
-    elif names:
-        return names[0]
-    return "Unknown Intersection"
-
-# =========================
-# Turn-by-turn formatting
-# =========================
-def step_road_name(step):
-    # Prefer explicit step name; fall back to parsing instruction
-    name = step.get("name")
-    if name:
-        return name
-    instr = step.get("maneuver", {}).get("instruction", "")
-    for token in ["onto ", "on "]:
-        if token in instr:
-            part = instr.split(token, 1)[1].strip()
-            for sep in [" and", ","]:
-                part = part.split(sep, 1)[0]
-            return part
-    return ""
-
-def format_step(step, dist_mi):
-    man = step.get("maneuver", {})
-    man_type = man.get("type", "")
-    instr = man.get("instruction", "").strip()
-    road_after = step_road_name(step)
-
-    # Depart: explicit “Drive on X …”
-    if man_type == "depart":
-        if road_after:
-            return f"- Drive on {road_after} for {dist_mi:.2f} miles"
-        return f"- Drive for {dist_mi:.2f} miles"
-
-    # Typical turn/merge/exit steps
-    if man_type in ("turn", "fork", "merge", "exit", "roundabout", "on ramp", "off ramp"):
-        if road_after and (" onto " not in instr and " on " not in instr):
-            return f"- {instr} onto {road_after}; continue for {dist_mi:.2f} miles"
-        if road_after:
-            return f"- {instr}; continue on {road_after} for {dist_mi:.2f} miles"
-        return f"- {instr} for {dist_mi:.2f} miles"
-
-    # Generic continuation
-    if road_after:
-        return f"- Continue on {road_after} for {dist_mi:.2f} miles"
-    return f"- Continue for {dist_mi:.2f} miles"
-
-# =========================
-# Input form (prevents intermediate reruns)
-# =========================
-with st.form("dig_form", clear_on_submit=False):
-    lat = st.number_input("Latitude", value=39.432544, format="%.6f")
-    lon = st.number_input("Longitude", value=-94.275491, format="%.6f")
-    submitted = st.form_submit_button("Get directions")
-
-# =========================
-# Compute once on submit
-# =========================
-if submitted:
     try:
-        # 1) Nearest town (name and center)
-        town_url = (
-            f"https://api.mapbox.com/geocoding/v5/mapbox.places/"
-            f"{lon},{lat}.json?types=place&language=en&access_token={MAPBOX_TOKEN}"
-        )
-        town_resp = requests.get(town_url).json()
-        if not town_resp.get("features"):
-            st.error("No nearby town found.")
-            st.stop()
-        town_feat = town_resp["features"][0]
-        town_name, town_state = extract_town_state(town_feat)
-
-        # 2) Seed route from town center to dig to get actual route start coord
-        town_center = town_feat["center"]  # [lon, lat]
-        dir_seed_url = (
-            f"https://api.mapbox.com/directions/v5/mapbox/driving/"
-            f"{town_center[0]},{town_center[1]};{lon},{lat}"
-            f"?steps=true&geometries=polyline&overview=full&language=en&access_token={MAPBOX_TOKEN}"
-        )
-        dir_seed = requests.get(dir_seed_url).json()
-        if not dir_seed.get("routes"):
-            st.error("No route found from town.")
-            st.stop()
-        seed_route = dir_seed["routes"][0]
-        seed_steps = seed_route["legs"][0]["steps"]
-        first_step = seed_steps[0]
-        start_location = first_step["maneuver"]["location"]  # [lon, lat]
-
-        # 3) Label intersection near that true start location
-        intersection_label = pick_intersection_label_near_point(start_location[0], start_location[1])
-
-        # 4) Final directions from aligned start to dig
-        dir_url = (
-            f"https://api.mapbox.com/directions/v5/mapbox/driving/"
-            f"{start_location[0]},{start_location[1]};{lon},{lat}"
-            f"?steps=true&geometries=polyline&overview=full&language=en&access_token={MAPBOX_TOKEN}"
-        )
-        dir_resp = requests.get(dir_url).json()
-        if not dir_resp.get("routes"):
-            st.error("No route found.")
-            st.stop()
-
-        route = dir_resp["routes"][0]
-        steps = route["legs"][0]["steps"]
-        route_coords = polyline.decode(route["geometry"])  # list of (lat, lon)
-
-        # 5) Narrative: Mapbox instructions + road names; final left/right via nearest-segment projection
-        narrative = [f"From the intersection of {intersection_label} in {town_name}, {town_state}, travel as follows:"]
-        for i, step in enumerate(steps):
-            if i == len(steps) - 1:
-                side = side_relative_to_route(route_coords, lat, lon)
-                narrative.append(f"- The dig site will be located on your {side}.")
-            else:
-                dist_mi = step["distance"] / 1609.34
-                narrative.append(format_step(step, dist_mi))
-
-        # 6) Map
-        m = folium.Map(location=[lat, lon], zoom_start=14)
-        folium.Marker([lat, lon], tooltip="Dig Site", icon=folium.Icon(color="red")).add_to(m)
-        folium.Marker([start_location[1], start_location[0]], tooltip="Start Intersection").add_to(m)
-        folium.PolyLine(route_coords, color="blue", weight=3).add_to(m)
-
-        st.session_state.narrative = narrative
-        st.session_state.map_html = m._repr_html_()
-
+        resp = requests.get(url, timeout=20)
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Request error for {label}: {e}")
+        return None
 
-# =========================
-# Persisted display
-# =========================
-if st.session_state.narrative:
-    st.subheader("Turn‑by‑Turn Directions")
-    st.write("\n".join(st.session_state.narrative))
+    if resp.status_code != 200:
+        st.error(f"Mapbox error for {label}: {resp.status_code} {resp.text[:200]}")
+        return None
 
-if st.session_state.map_html:
-    st.components.v1.html(st.session_state.map_html, height=520)
+    try:
+        image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+    except Exception as e:
+        st.error(f"PIL error for {label}: {e}")
+        return None
 
-# Manual reset
-if st.button("Clear results"):
-    st.session_state.narrative = None
-    st.session_state.map_html = None
+    draw = ImageDraw.Draw(image)
+
+    # Yellow dot at center
+    cx, cy = image.width // 2, image.height // 2
+    draw.ellipse([(cx-6, cy-6), (cx+6, cy+6)], fill="yellow", outline="black")
+
+    # Label
+    label = label.upper()
+    try:
+        font = ImageFont.truetype("arial.ttf", 28)
+    except:
+        font = ImageFont.load_default()
+
+    try:
+        bbox = font.getbbox(label)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    except Exception:
+        tw, th = draw.textlength(label, font=font), 28
+
+    lx, ly = cx + 12, cy - th - 6
+    draw.rectangle([lx-4, ly-4, lx+tw+4, ly+th+4], fill="white", outline="black")
+    draw.text((lx, ly), label, fill="black", font=font)
+
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG")
+    buf.seek(0)
+    return buf.read()
+
+# --- Main logic ---
+uploaded_file = st.file_uploader("Upload Excel file (.xlsx or .xlsm)", type=["xlsx","xlsm"])
+if uploaded_file and MAPBOX_TOKEN:
+    try:
+        uploaded_file.seek(0)
+        wb = load_workbook(io.BytesIO(uploaded_file.read()), data_only=True, read_only=True)
+        dig_tabs = [s for s in wb.sheetnames if s.lower().startswith("dig") and s.lower() != "dig list"]
+
+        if not dig_tabs:
+            st.error("No valid Dig tabs found (excluding 'Dig list').")
+        else:
+            st.success(f"Found {len(dig_tabs)} Dig tabs")
+            if st.button("Generate Aerial Images"):
+                zip_buffer = io.BytesIO()
+                success_count, fail_count = 0, 0
+                progress = st.progress(0)
+
+                with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+                    for i, sheet in enumerate(dig_tabs):
+                        try:
+                            ws = wb[sheet]
+                            lat_val, lon_val = ws["AR15"].value, ws["AS15"].value
+                            lat, lon = float(lat_val), float(lon_val)
+
+                            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                                st.warning(f"Skipping {sheet}: out-of-bounds coords ({lat}, {lon})")
+                                fail_count += 1
+                                continue
+
+                            img = fetch_satellite_image(lat, lon, sheet, MAPBOX_TOKEN)
+                            if img:
+                                zip_file.writestr(f"{sheet}.jpg", img)
+                                success_count += 1
+                            else:
+                                fail_count += 1
+                        except Exception as e:
+                            st.error(f"Error processing {sheet}: {e}")
+                            st.code(traceback.format_exc())
+                            fail_count += 1
+
+                        progress.progress((i+1)/len(dig_tabs))
+
+                zip_buffer.seek(0)
+                st.download_button(
+                    f"📦 Download {success_count} Images (failed {fail_count})",
+                    data=zip_buffer,
+                    file_name="dig_site_images.zip",
+                    mime="application/zip"
+                )
+    except Exception as e:
+        st.error(f"Top-level error: {e}")
+        st.code(traceback.format_exc())
+
+st.caption("© Mapbox © OpenStreetMap contributors")
